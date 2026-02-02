@@ -8,6 +8,8 @@
 #include <atomic>
 #include <sstream>
 #include <iomanip>
+#include <condition_variable>
+#include <mutex>
 
 #ifdef _WIN32
     #include <winsock2.h>
@@ -25,342 +27,8 @@
 // Глобальные флаги
 std::atomic<bool> g_running{true};
 std::atomic<bool> g_receiver_active{false};
-
-class NATDetector {
-private:
-    struct STUNServer {
-        std::string host;
-        int port;
-        sockaddr_in addr;
-    };
-    
-    std::vector<STUNServer> servers;
-    
-public:
-    NATDetector() {
-        // Инициализация STUN серверов
-        std::vector<std::pair<std::string, int>> server_list = {
-            {"stun.l.google.com", 19302},
-            {"stun1.l.google.com", 19302},
-            {"stun2.l.google.com", 19302},
-            {"stun3.l.google.com", 19302}
-        };
-        
-        for (const auto& s : server_list) {
-            STUNServer server;
-            server.host = s.first;
-            server.port = s.second;
-            
-            // Получаем адрес сервера
-            hostent* he = gethostbyname(server.host.c_str());
-            if (he) {
-                server.addr.sin_family = AF_INET;
-                server.addr.sin_port = htons(server.port);
-                memcpy(&server.addr.sin_addr, he->h_addr_list[0], he->h_length);
-                servers.push_back(server);
-            }
-        }
-    }
-    
-    std::string detectNATType(int test_port = 54321) {
-        std::cout << "\n=== DETECTING NAT TYPE ===\n";
-        
-        // Создаем основной сокет
-        int main_sock = socket(AF_INET, SOCK_DGRAM, 0);
-        if (main_sock < 0) {
-            return "ERROR: Cannot create socket";
-        }
-        
-        // Привязываем к тестовому порту
-        sockaddr_in local_addr;
-        local_addr.sin_family = AF_INET;
-        local_addr.sin_port = htons(test_port);
-        local_addr.sin_addr.s_addr = INADDR_ANY;
-        
-        if (bind(main_sock, (sockaddr*)&local_addr, sizeof(local_addr)) < 0) {
-            // Пробуем случайный порт
-            local_addr.sin_port = 0;
-            bind(main_sock, (sockaddr*)&local_addr, sizeof(local_addr));
-        }
-        
-        // Получаем фактический порт
-        socklen_t len = sizeof(local_addr);
-        getsockname(main_sock, (sockaddr*)&local_addr, &len);
-        int actual_port = ntohs(local_addr.sin_port);
-        std::cout << "Testing on port: " << actual_port << "\n";
-        
-        // Тест 1: Получаем публичный адрес от двух разных серверов
-        std::vector<std::pair<std::string, int>> public_addresses;
-        
-        for (size_t i = 0; i < std::min(servers.size(), size_t(2)); i++) {
-            auto public_addr = getPublicAddress(main_sock, servers[i]);
-            if (!public_addr.first.empty()) {
-                public_addresses.push_back(public_addr);
-                std::cout << "Server " << i+1 << ": " << public_addr.first 
-                         << ":" << public_addr.second << "\n";
-            }
-        }
-        
-        if (public_addresses.size() < 2) {
-            #ifdef _WIN32
-                closesocket(main_sock);
-            #else
-                close(main_sock);
-            #endif
-            return "ERROR: Cannot reach STUN servers";
-        }
-        
-        // Проверяем Full Cone NAT
-        bool is_full_cone = testFullCone(main_sock, servers[0], public_addresses[0]);
-        
-        // Проверяем Restricted Cone NAT
-        bool is_restricted_cone = false;
-        if (!is_full_cone) {
-            is_restricted_cone = testRestrictedCone(main_sock, servers[0], servers[1]);
-        }
-        
-        // Проверяем Port Restricted Cone NAT
-        bool is_port_restricted = false;
-        if (!is_full_cone && !is_restricted_cone) {
-            is_port_restricted = testPortRestrictedCone(main_sock, servers[0]);
-        }
-        
-        // Проверяем Symmetric NAT
-        bool is_symmetric = false;
-        if (!is_full_cone && !is_restricted_cone && !is_port_restricted) {
-            is_symmetric = testSymmetricNAT(main_sock, servers[0], servers[1]);
-        }
-        
-        #ifdef _WIN32
-            closesocket(main_sock);
-        #else
-            close(main_sock);
-        #endif
-        
-        // Определяем тип NAT
-        std::string nat_type;
-        if (public_addresses[0] == public_addresses[1]) {
-            if (is_full_cone) nat_type = "FULL CONE NAT";
-            else if (is_restricted_cone) nat_type = "RESTRICTED CONE NAT";
-            else if (is_port_restricted) nat_type = "PORT RESTRICTED CONE NAT";
-            else if (is_symmetric) nat_type = "SYMMETRIC NAT";
-            else nat_type = "UNKNOWN NAT (Probably Symmetric)";
-        } else {
-            nat_type = "SYMMETRIC NAT (Different ports for different servers)";
-        }
-        
-        // Проверяем есть ли публичный IP (без NAT)
-        char local_ip[INET_ADDRSTRLEN];
-        inet_ntop(AF_INET, &local_addr.sin_addr, local_ip, sizeof(local_ip));
-        
-        if (public_addresses[0].first == local_ip) {
-            nat_type = "NO NAT (Public IP)";
-        }
-        
-        std::cout << "\n=== NAT DETECTION RESULT ===\n";
-        std::cout << "Local IP: " << local_ip << ":" << actual_port << "\n";
-        std::cout << "Public IP: " << public_addresses[0].first 
-                  << ":" << public_addresses[0].second << "\n";
-        std::cout << "NAT Type: " << nat_type << "\n";
-        std::cout << "==============================\n";
-        
-        return nat_type;
-    }
-    
-private:
-    std::pair<std::string, int> getPublicAddress(int sock, const STUNServer& server) {
-        // Создаем STUN Binding Request
-        unsigned char request[20];
-        
-        // STUN header
-        request[0] = 0x00; // Request
-        request[1] = 0x01; // Binding
-        request[2] = 0x00; // Length = 0
-        request[3] = 0x00;
-        
-        // Magic Cookie
-        request[4] = 0x21;
-        request[5] = 0x12;
-        request[6] = 0xA4;
-        request[7] = 0x42;
-        
-        // Random Transaction ID
-        srand(static_cast<unsigned>(time(nullptr)));
-        for (int i = 8; i < 20; i++) {
-            request[i] = rand() % 256;
-        }
-        
-        // Отправляем запрос
-        sendto(sock, reinterpret_cast<char*>(request), 20, 0,
-              (sockaddr*)&server.addr, sizeof(server.addr));
-        
-        // Ждем ответ
-        unsigned char response[512];
-        sockaddr_in from_addr;
-        
-        #ifdef _WIN32
-            int from_len = sizeof(from_addr);
-        #else
-            socklen_t from_len = sizeof(from_addr);
-        #endif
-        
-        fd_set read_set;
-        FD_ZERO(&read_set);
-        FD_SET(sock, &read_set);
-        
-        timeval timeout;
-        timeout.tv_sec = 3;
-        timeout.tv_usec = 0;
-        
-        if (select(sock + 1, &read_set, NULL, NULL, &timeout) > 0) {
-            int len = recvfrom(sock, reinterpret_cast<char*>(response), sizeof(response), 0,
-                              (sockaddr*)&from_addr, &from_len);
-            
-            if (len >= 20 && response[0] == 0x01 && response[1] == 0x01) {
-                // Парсим XOR-MAPPED-ADDRESS
-                int pos = 20;
-                while (pos + 4 <= len) {
-                    uint16_t attr_type = (response[pos] << 8) | response[pos + 1];
-                    uint16_t attr_len = (response[pos + 2] << 8) | response[pos + 3];
-                    
-                    if (attr_type == 0x0020 && attr_len >= 8) { // XOR-MAPPED-ADDRESS
-                        uint16_t port = (response[pos + 6] << 8) | response[pos + 7];
-                        port ^= 0x2112;
-                        
-                        std::string ip = std::to_string(response[pos + 8] ^ 0x21) + "." +
-                                       std::to_string(response[pos + 9] ^ 0x12) + "." +
-                                       std::to_string(response[pos + 10] ^ 0xA4) + "." +
-                                       std::to_string(response[pos + 11] ^ 0x42);
-                        
-                        return {ip, port};
-                    }
-                    pos += 4 + attr_len;
-                }
-            }
-        }
-        
-        return {"", 0};
-    }
-    
-    bool testFullCone(int sock, const STUNServer& server, 
-                     const std::pair<std::string, int>& public_addr) {
-        std::cout << "Testing Full Cone NAT... ";
-        
-        // Создаем новый сокет и отправляем запрос
-        int test_sock = socket(AF_INET, SOCK_DGRAM, 0);
-        sockaddr_in test_local;
-        test_local.sin_family = AF_INET;
-        test_local.sin_port = 0;
-        test_local.sin_addr.s_addr = INADDR_ANY;
-        bind(test_sock, (sockaddr*)&test_local, sizeof(test_local));
-        
-        // Отправляем пакет на сервер
-        unsigned char request[20];
-        request[0] = 0x00; request[1] = 0x01;
-        request[2] = 0x00; request[3] = 0x00;
-        request[4] = 0x21; request[5] = 0x12;
-        request[6] = 0xA4; request[7] = 0x42;
-        for (int i = 8; i < 20; i++) request[i] = rand() % 256;
-        
-        sendto(test_sock, reinterpret_cast<char*>(request), 20, 0,
-              (sockaddr*)&server.addr, sizeof(server.addr));
-        
-        // Пытаемся получить ответ на основном сокете
-        unsigned char response[512];
-        sockaddr_in from_addr;
-        
-        #ifdef _WIN32
-            int from_len = sizeof(from_addr);
-        #else
-            socklen_t from_len = sizeof(from_addr);
-        #endif
-        
-        fd_set read_set;
-        FD_ZERO(&read_set);
-        FD_SET(sock, &read_set);
-        
-        timeval timeout;
-        timeout.tv_sec = 2;
-        timeout.tv_usec = 0;
-        
-        bool result = (select(sock + 1, &read_set, NULL, NULL, &timeout) > 0);
-        
-        #ifdef _WIN32
-            closesocket(test_sock);
-        #else
-            close(test_sock);
-        #endif
-        
-        std::cout << (result ? "YES" : "NO") << "\n";
-        return result;
-    }
-    
-    bool testRestrictedCone(int sock, const STUNServer& server1, 
-                           const STUNServer& server2) {
-        std::cout << "Testing Restricted Cone NAT... ";
-        
-        // Сначала отправляем на сервер1
-        unsigned char request[20];
-        request[0] = 0x00; request[1] = 0x01;
-        request[2] = 0x00; request[3] = 0x00;
-        request[4] = 0x21; request[5] = 0x12;
-        request[6] = 0xA4; request[7] = 0x42;
-        for (int i = 8; i < 20; i++) request[i] = rand() % 256;
-        
-        sendto(sock, reinterpret_cast<char*>(request), 20, 0,
-              (sockaddr*)&server1.addr, sizeof(server1.addr));
-        
-        // Ждем немного
-        #ifdef _WIN32
-            Sleep(100);
-        #else
-            usleep(100000);
-        #endif
-        
-        // Теперь пытаемся получить от сервера2
-        unsigned char response[512];
-        sockaddr_in from_addr;
-        
-        #ifdef _WIN32
-            int from_len = sizeof(from_addr);
-        #else
-            socklen_t from_len = sizeof(from_addr);
-        #endif
-        
-        fd_set read_set;
-        FD_ZERO(&read_set);
-        FD_SET(sock, &read_set);
-        
-        timeval timeout;
-        timeout.tv_sec = 2;
-        timeout.tv_usec = 0;
-        
-        bool result = (select(sock + 1, &read_set, NULL, NULL, &timeout) > 0);
-        
-        std::cout << (result ? "YES" : "NO") << "\n";
-        return result;
-    }
-    
-    bool testPortRestrictedCone(int sock, const STUNServer& server) {
-        std::cout << "Testing Port Restricted Cone NAT... ";
-        // Для простоты считаем, что если не Full и не Restricted, то Port Restricted
-        std::cout << "MAYBE\n";
-        return false;
-    }
-    
-    bool testSymmetricNAT(int sock, const STUNServer& server1, 
-                         const STUNServer& server2) {
-        std::cout << "Testing Symmetric NAT... ";
-        
-        // Отправляем на оба сервера и сравниваем порты
-        auto addr1 = getPublicAddress(sock, server1);
-        auto addr2 = getPublicAddress(sock, server2);
-        
-        bool result = (addr1.second != addr2.second);
-        std::cout << (result ? "YES" : "NO") << "\n";
-        return result;
-    }
-};
+std::atomic<bool> g_connection_established{false};
+std::mutex g_cout_mutex;
 
 class P2PChat {
 private:
@@ -369,9 +37,17 @@ private:
     std::string public_ip;
     int public_port;
     std::string nat_type;
+    sockaddr_in peer_addr;
+    bool peer_configured;
+    
+    // Синхронизация
+    std::mutex mtx;
+    std::condition_variable cv;
+    bool ready_for_punching;
     
 public:
-    P2PChat() : sock(-1), local_port(0), public_port(0) {
+    P2PChat() : sock(-1), local_port(0), public_port(0), 
+                peer_configured(false), ready_for_punching(false) {
         #ifdef _WIN32
             WSADATA wsa;
             WSAStartup(MAKEWORD(2,2), &wsa);
@@ -393,20 +69,11 @@ public:
             return false;
         }
         
-        // Определяем тип NAT
-        NATDetector detector;
-        nat_type = detector.detectNATType();
-        
-        // Если Symmetric NAT - предлагаем альтернативы
-        if (nat_type.find("SYMMETRIC") != std::string::npos ||
-            nat_type.find("PORT RESTRICTED") != std::string::npos) {
-            std::cout << "\n⚠️  WARNING: Your NAT type may prevent direct P2P!\n";
-            std::cout << "Recommendations:\n";
-            std::cout << "1. Enable UPnP in router settings\n";
-            std::cout << "2. Manually forward ports\n";
-            std::cout << "3. Use ZeroTier/Tailscale\n";
-            std::cout << "4. Try anyway (may work)\n";
-        }
+        // Устанавливаем неблокирующий режим (для Windows)
+        #ifdef _WIN32
+            u_long mode = 1;
+            ioctlsocket(sock, FIONBIO, &mode);
+        #endif
         
         return true;
     }
@@ -415,41 +82,58 @@ public:
         std::cout << "\n=== GETTING PUBLIC INFORMATION ===\n";
         
         // Используем STUN для получения публичного адреса
-        STUNServer server = {"stun.l.google.com", 19302};
-        hostent* he = gethostbyname(server.host.c_str());
+        const char* stun_host = "stun.l.google.com";
+        int stun_port = 19302;
+        
+        // Получаем адрес STUN сервера
+        hostent* he = gethostbyname(stun_host);
         if (!he) {
             std::cout << "Cannot resolve STUN server\n";
             return;
         }
         
-        server.addr.sin_family = AF_INET;
-        server.addr.sin_port = htons(server.port);
-        memcpy(&server.addr.sin_addr, he->h_addr_list[0], he->h_length);
+        sockaddr_in server_addr;
+        server_addr.sin_family = AF_INET;
+        server_addr.sin_port = htons(stun_port);
+        memcpy(&server_addr.sin_addr, he->h_addr_list[0], he->h_length);
         
-        // Привязываем сокет
+        // Привязываем сокет к любому порту
         sockaddr_in local;
         local.sin_family = AF_INET;
         local.sin_port = 0; // Автовыбор порта
         local.sin_addr.s_addr = INADDR_ANY;
-        bind(sock, (sockaddr*)&local, sizeof(local));
+        
+        if (bind(sock, (sockaddr*)&local, sizeof(local)) < 0) {
+            std::cout << "Bind failed\n";
+            return;
+        }
         
         // Получаем локальный порт
         socklen_t len = sizeof(local);
         getsockname(sock, (sockaddr*)&local, &len);
         local_port = ntohs(local.sin_port);
         
-        // Получаем публичный адрес
+        // Получаем локальный IP
+        char local_ip_str[INET_ADDRSTRLEN];
+        inet_ntop(AF_INET, &local.sin_addr, local_ip_str, sizeof(local_ip_str));
+        
+        // Получаем публичный адрес через STUN
         unsigned char request[20];
         request[0] = 0x00; request[1] = 0x01;
         request[2] = 0x00; request[3] = 0x00;
         request[4] = 0x21; request[5] = 0x12;
         request[6] = 0xA4; request[7] = 0x42;
+        
         srand(static_cast<unsigned>(time(nullptr)));
-        for (int i = 8; i < 20; i++) request[i] = rand() % 256;
+        for (int i = 8; i < 20; i++) {
+            request[i] = rand() % 256;
+        }
         
+        // Отправляем STUN запрос
         sendto(sock, reinterpret_cast<char*>(request), 20, 0,
-              (sockaddr*)&server.addr, sizeof(server.addr));
+              (sockaddr*)&server_addr, sizeof(server_addr));
         
+        // Ждем ответ
         unsigned char response[512];
         sockaddr_in from_addr;
         
@@ -459,43 +143,57 @@ public:
             socklen_t from_len = sizeof(from_addr);
         #endif
         
-        fd_set read_set;
-        FD_ZERO(&read_set);
-        FD_SET(sock, &read_set);
-        
-        timeval timeout;
-        timeout.tv_sec = 3;
-        timeout.tv_usec = 0;
-        
-        if (select(sock + 1, &read_set, NULL, NULL, &timeout) > 0) {
-            int resp_len = recvfrom(sock, reinterpret_cast<char*>(response), sizeof(response), 0,
-                                  (sockaddr*)&from_addr, &from_len);
+        // Даем несколько попыток
+        for (int attempt = 0; attempt < 3; attempt++) {
+            fd_set read_set;
+            FD_ZERO(&read_set);
+            FD_SET(sock, &read_set);
             
-            if (resp_len >= 20 && response[0] == 0x01 && response[1] == 0x01) {
-                int pos = 20;
-                while (pos + 4 <= resp_len) {
-                    uint16_t attr_type = (response[pos] << 8) | response[pos + 1];
-                    uint16_t attr_len = (response[pos + 2] << 8) | response[pos + 3];
-                    
-                    if (attr_type == 0x0020 && attr_len >= 8) {
-                        public_port = (response[pos + 6] << 8) | response[pos + 7];
-                        public_port ^= 0x2112;
+            timeval timeout;
+            timeout.tv_sec = 2;
+            timeout.tv_usec = 0;
+            
+            if (select(sock + 1, &read_set, NULL, NULL, &timeout) > 0) {
+                int resp_len = recvfrom(sock, reinterpret_cast<char*>(response), 
+                                       sizeof(response), 0,
+                                       (sockaddr*)&from_addr, &from_len);
+                
+                if (resp_len >= 20 && response[0] == 0x01 && response[1] == 0x01) {
+                    // Парсим XOR-MAPPED-ADDRESS
+                    int pos = 20;
+                    while (pos + 4 <= resp_len) {
+                        uint16_t attr_type = (response[pos] << 8) | response[pos + 1];
+                        uint16_t attr_len = (response[pos + 2] << 8) | response[pos + 3];
                         
-                        public_ip = std::to_string(response[pos + 8] ^ 0x21) + "." +
-                                   std::to_string(response[pos + 9] ^ 0x12) + "." +
-                                   std::to_string(response[pos + 10] ^ 0xA4) + "." +
-                                   std::to_string(response[pos + 11] ^ 0x42);
-                        break;
+                        if (attr_type == 0x0020 && attr_len >= 8) { // XOR-MAPPED-ADDRESS
+                            public_port = (response[pos + 6] << 8) | response[pos + 7];
+                            public_port ^= 0x2112;
+                            
+                            public_ip = std::to_string(response[pos + 8] ^ 0x21) + "." +
+                                       std::to_string(response[pos + 9] ^ 0x12) + "." +
+                                       std::to_string(response[pos + 10] ^ 0xA4) + "." +
+                                       std::to_string(response[pos + 11] ^ 0x42);
+                            
+                            std::cout << "Local endpoint: " << local_ip_str << ":" << local_port << "\n";
+                            std::cout << "Public endpoint: " << public_ip << ":" << public_port << "\n";
+                            std::cout << "NAT Type: RESTRICTED CONE NAT (based on your info)\n";
+                            std::cout << "===================================\n";
+                            return;
+                        }
+                        pos += 4 + attr_len;
                     }
-                    pos += 4 + attr_len;
                 }
+            }
+            
+            // Повторяем запрос если не получили ответ
+            if (attempt < 2) {
+                for (int i = 8; i < 20; i++) request[i] = rand() % 256;
+                sendto(sock, reinterpret_cast<char*>(request), 20, 0,
+                      (sockaddr*)&server_addr, sizeof(server_addr));
             }
         }
         
-        std::cout << "Local endpoint: " << getLocalIP() << ":" << local_port << "\n";
-        std::cout << "Public endpoint: " << public_ip << ":" << public_port << "\n";
-        std::cout << "NAT Type: " << nat_type << "\n";
-        std::cout << "===================================\n";
+        std::cout << "Failed to get public address\n";
     }
     
     void run() {
@@ -525,46 +223,75 @@ private:
     void runAsHost() {
         std::cout << "\n=== HOST MODE ===\n";
         std::cout << "Your public address: " << public_ip << ":" << public_port << "\n";
-        std::cout << "Share this with your peer!\n";
-        std::cout << "Waiting for connection...\n";
+        std::cout << "Share this with your peer!\n\n";
+        
+        // Ждем когда клиент будет готов
+        std::cout << "When your peer is ready, type 'ready' and press Enter: ";
+        std::string input;
+        std::getline(std::cin, input);
+        
+        if (input != "ready") {
+            std::cout << "Aborted\n";
+            return;
+        }
+        
+        // Получаем данные клиента
+        std::string client_ip;
+        int client_port;
+        
+        std::cout << "Enter client's PUBLIC IP: ";
+        std::getline(std::cin, client_ip);
+        
+        std::cout << "Enter client's PUBLIC PORT: ";
+        std::cin >> client_port;
+        std::cin.ignore();
+        
+        // Настраиваем адрес пира
+        peer_addr.sin_family = AF_INET;
+        peer_addr.sin_port = htons(client_port);
+        inet_pton(AF_INET, client_ip.c_str(), &peer_addr.sin_addr);
+        peer_configured = true;
+        
+        std::cout << "\nTarget set: " << client_ip << ":" << client_port << "\n";
         
         // Запускаем поток приемника
         g_receiver_active = true;
         std::thread receiver(&P2PChat::receiverThread, this);
         
-        std::cout << "\nType messages (or 'exit' to quit):\n";
+        // Даем время потоку запуститься
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
         
-        std::string message;
-        sockaddr_in peer_addr;
-        bool peer_connected = false;
+        std::cout << "\n=== STARTING HOLE PUNCHING ===\n";
+        std::cout << "Both sides must punch simultaneously!\n";
+        std::cout << "Starting in 3 seconds...\n";
         
-        while (g_running) {
-            std::cout << "You: ";
-            std::getline(std::cin, message);
-            
-            if (message == "exit") {
-                g_running = false;
-                break;
-            }
-            
-            if (!peer_connected && message.substr(0, 7) == "connect") {
-                // Устанавливаем соединение
-                std::istringstream iss(message);
-                std::string cmd, peer_ip;
-                int peer_port;
-                iss >> cmd >> peer_ip >> peer_port;
-                
-                peer_addr.sin_family = AF_INET;
-                peer_addr.sin_port = htons(peer_port);
-                inet_pton(AF_INET, peer_ip.c_str(), &peer_addr.sin_addr);
-                peer_connected = true;
-                
-                std::cout << "Connected to " << peer_ip << ":" << peer_port << "\n";
-            } else if (peer_connected) {
-                sendto(sock, message.c_str(), message.length(), 0,
-                      (sockaddr*)&peer_addr, sizeof(peer_addr));
-            }
+        for (int i = 3; i > 0; i--) {
+            std::cout << i << "...\n";
+            std::this_thread::sleep_for(std::chrono::seconds(1));
         }
+        
+        std::cout << "GO! Punching...\n";
+        
+        // Отправляем 15 пакетов для hole punching
+        for (int i = 0; i < 15; i++) {
+            std::string punch_msg = "PUNCH_" + std::to_string(i) + "_HOST";
+            sendto(sock, punch_msg.c_str(), punch_msg.length(), 0,
+                  (sockaddr*)&peer_addr, sizeof(peer_addr));
+            
+            {
+                std::lock_guard<std::mutex> lock(g_cout_mutex);
+                std::cout << "Sent punch #" << i << "\n";
+            }
+            
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        }
+        
+        std::cout << "\n✅ Hole punching completed!\n";
+        std::cout << "You should now be able to exchange messages.\n";
+        std::cout << "Type 'exit' to quit.\n\n";
+        
+        // Основной цикл чата
+        chatLoop();
         
         g_receiver_active = false;
         receiver.join();
@@ -573,43 +300,83 @@ private:
     void runAsClient() {
         std::cout << "\n=== CLIENT MODE ===\n";
         
-        std::string peer_ip;
-        int peer_port;
+        // Получаем данные хоста
+        std::string host_ip;
+        int host_port;
         
-        std::cout << "Enter host's public IP: ";
-        std::cin >> peer_ip;
-        std::cout << "Enter host's public port: ";
-        std::cin >> peer_port;
+        std::cout << "Enter host's PUBLIC IP: ";
+        std::getline(std::cin, host_ip);
+        
+        std::cout << "Enter host's PUBLIC PORT: ";
+        std::cin >> host_port;
         std::cin.ignore();
         
-        sockaddr_in peer_addr;
+        // Настраиваем адрес пира
         peer_addr.sin_family = AF_INET;
-        peer_addr.sin_port = htons(peer_port);
-        inet_pton(AF_INET, peer_ip.c_str(), &peer_addr.sin_addr);
+        peer_addr.sin_port = htons(host_port);
+        inet_pton(AF_INET, host_ip.c_str(), &peer_addr.sin_addr);
+        peer_configured = true;
         
-        // Пробуем hole punching
-        std::cout << "\nAttempting hole punching...\n";
-        for (int i = 0; i < 10; i++) {
-            std::string punch = "PUNCH_" + std::to_string(i);
-            sendto(sock, punch.c_str(), punch.length(), 0,
-                  (sockaddr*)&peer_addr, sizeof(peer_addr));
-            
-            std::cout << "Punch " << i+1 << " sent\n";
-            
-            #ifdef _WIN32
-                Sleep(300);
-            #else
-                usleep(300000);
-            #endif
+        std::cout << "\nTarget set: " << host_ip << ":" << host_port << "\n";
+        
+        // Ждем сигнал от хоста
+        std::cout << "\nTell the host you're ready.\n";
+        std::cout << "When host says 'ready', type 'ready' and press Enter: ";
+        
+        std::string input;
+        std::getline(std::cin, input);
+        
+        if (input != "ready") {
+            std::cout << "Aborted\n";
+            return;
         }
         
-        // Запускаем приемник
+        // Запускаем поток приемника
         g_receiver_active = true;
         std::thread receiver(&P2PChat::receiverThread, this);
         
-        std::cout << "\nConnection ready! Type messages:\n";
+        // Даем время потоку запуститься
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
         
+        std::cout << "\n=== STARTING HOLE PUNCHING ===\n";
+        std::cout << "Both sides must punch simultaneously!\n";
+        std::cout << "Starting in 3 seconds...\n";
+        
+        for (int i = 3; i > 0; i--) {
+            std::cout << i << "...\n";
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+        }
+        
+        std::cout << "GO! Punching...\n";
+        
+        // Отправляем 15 пакетов для hole punching
+        for (int i = 0; i < 15; i++) {
+            std::string punch_msg = "PUNCH_" + std::to_string(i) + "_CLIENT";
+            sendto(sock, punch_msg.c_str(), punch_msg.length(), 0,
+                  (sockaddr*)&peer_addr, sizeof(peer_addr));
+            
+            {
+                std::lock_guard<std::mutex> lock(g_cout_mutex);
+                std::cout << "Sent punch #" << i << "\n";
+            }
+            
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        }
+        
+        std::cout << "\n✅ Hole punching completed!\n";
+        std::cout << "You should now be able to exchange messages.\n";
+        std::cout << "Type 'exit' to quit.\n\n";
+        
+        // Основной цикл чата
+        chatLoop();
+        
+        g_receiver_active = false;
+        receiver.join();
+    }
+    
+    void chatLoop() {
         std::string message;
+        
         while (g_running) {
             std::cout << "You: ";
             std::getline(std::cin, message);
@@ -619,27 +386,32 @@ private:
                 break;
             }
             
-            sendto(sock, message.c_str(), message.length(), 0,
-                  (sockaddr*)&peer_addr, sizeof(peer_addr));
+            if (peer_configured && !message.empty()) {
+                int sent = sendto(sock, message.c_str(), message.length(), 0,
+                                (sockaddr*)&peer_addr, sizeof(peer_addr));
+                
+                if (sent > 0) {
+                    std::cout << "Message sent (" << sent << " bytes)\n";
+                }
+            }
         }
-        
-        g_receiver_active = false;
-        receiver.join();
     }
     
     void receiverThread() {
         std::cout << "Receiver thread started\n";
         
         char buffer[1024];
+        int packet_count = 0;
         
         while (g_receiver_active) {
+            // Проверяем сокет на наличие данных
             fd_set read_set;
             FD_ZERO(&read_set);
             FD_SET(sock, &read_set);
             
             timeval timeout;
-            timeout.tv_sec = 1;
-            timeout.tv_usec = 0;
+            timeout.tv_sec = 0;
+            timeout.tv_usec = 100000; // 100ms
             
             int ready = select(sock + 1, &read_set, NULL, NULL, &timeout);
             
@@ -652,30 +424,55 @@ private:
                 
                 if (len > 0) {
                     buffer[len] = '\0';
+                    packet_count++;
+                    
                     char from_ip[INET_ADDRSTRLEN];
                     inet_ntop(AF_INET, &from_addr.sin_addr, from_ip, sizeof(from_ip));
+                    int from_port = ntohs(from_addr.sin_port);
                     
-                    std::cout << "\n[FROM " << from_ip << ":" 
-                             << ntohs(from_addr.sin_port) << "] "
-                             << buffer << "\n";
-                    std::cout << "You: " << std::flush;
+                    // Проверяем, это наш пир?
+                    bool is_peer = (peer_configured && 
+                                   from_addr.sin_addr.s_addr == peer_addr.sin_addr.s_addr &&
+                                   from_port == ntohs(peer_addr.sin_port));
+                    
+                    {
+                        std::lock_guard<std::mutex> lock(g_cout_mutex);
+                        std::cout << "\n═══════════════════════════════════════\n";
+                        
+                        if (std::string(buffer).find("PUNCH_") == 0) {
+                            std::cout << "[HOLE PUNCH PACKET #" << packet_count << "]\n";
+                        } else {
+                            std::cout << "[MESSAGE #" << packet_count << "]\n";
+                        }
+                        
+                        std::cout << "From: " << from_ip << ":" << from_port;
+                        
+                        if (is_peer) {
+                            std::cout << " (PEER)";
+                        } else if (packet_count == 1) {
+                            // Первый пакет - сохраняем как пира
+                            peer_addr = from_addr;
+                            peer_configured = true;
+                            g_connection_established = true;
+                            std::cout << " (NEW PEER - CONNECTION ESTABLISHED!)";
+                        }
+                        
+                        std::cout << "\nContent: " << buffer << "\n";
+                        std::cout << "═══════════════════════════════════════\n";
+                        std::cout << "You: " << std::flush;
+                    }
+                    
+                    // Автоответ на первое сообщение
+                    if (packet_count == 1 && std::string(buffer).find("PUNCH_") != 0) {
+                        std::string reply = "AUTO-REPLY: Got your message!";
+                        sendto(sock, reply.c_str(), reply.length(), 0,
+                              (sockaddr*)&from_addr, from_len);
+                    }
                 }
             }
         }
         
-        std::cout << "Receiver thread stopped\n";
-    }
-    
-    std::string getLocalIP() {
-        char buffer[128];
-        gethostname(buffer, sizeof(buffer));
-        
-        hostent* host = gethostbyname(buffer);
-        if (host && host->h_addr_list[0]) {
-            return inet_ntoa(*(in_addr*)host->h_addr_list[0]);
-        }
-        
-        return "127.0.0.1";
+        std::cout << "Receiver thread stopped. Total packets: " << packet_count << "\n";
     }
     
     void stop() {
@@ -688,16 +485,23 @@ private:
             sock = -1;
         }
     }
-    
-    struct STUNServer {
-        std::string host;
-        int port;
-        sockaddr_in addr;
-    };
 };
 
+void printBanner() {
+    std::cout << "╔═══════════════════════════════════════════════════════╗\n";
+    std::cout << "║         RESTRICTED CONE NAT P2P CHAT v2.0            ║\n";
+    std::cout << "║       Hole Punching with Synchronized Timing         ║\n";
+    std::cout << "╚═══════════════════════════════════════════════════════╝\n\n";
+}
+
 int main() {
-    std::cout << "=== ADVANCED P2P CHAT WITH NAT DETECTION ===\n\n";
+    printBanner();
+    
+    std::cout << "IMPORTANT: Both users must coordinate timing!\n";
+    std::cout << "1. One person chooses HOST, other chooses CLIENT\n";
+    std::cout << "2. HOST shares public IP:Port\n";
+    std::cout << "3. Both say 'ready' at the same time\n";
+    std::cout << "4. System counts down and starts hole punching\n\n";
     
     P2PChat chat;
     
